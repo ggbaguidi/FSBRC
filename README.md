@@ -178,6 +178,12 @@ Run:
 
 - `python src/train.py --val-weeks 6`
 
+Optional (better validation + small ensemble):
+
+- `python src/train.py --cv-folds 3 --val-weeks 6`
+
+This trains 3 rolling time folds and saves `lgb_*_fold*.txt` models; `predict.py` will automatically average them.
+
 Outputs:
 
 - LightGBM model files in `artifacts/`
@@ -186,6 +192,7 @@ Outputs:
 Optional:
 
 - `--two-stage-qty` trains conditional quantity models as well (kept for experimentation).
+- `--qty-objective` lets you experiment with alternative LightGBM objectives for quantity (default: `regression_l1`).
 
 ### 5.3 Generate a submission
 
@@ -252,19 +259,6 @@ This writes:
 - **Polars panic / rolling on Int8**: We cast `purchased_this_week` to `Int32` for rolling sums.
 - **LightGBM + pandas Arrow dtypes error**: We convert Polars to pandas with NumPy dtypes (`use_pyarrow_extension_array=False`).
 - **Missing columns in Test (e.g., selling_price)**: Feature casting is guarded; absent columns are skipped.
-
----
-
-## 9) Next improvements (still CPU-only)
-
-If you want to push leaderboard performance:
-
-1) Add more expressive ratio features (customer-SKU affinity):
-   - e.g., `roll_qty_sum / (cust_qty_sum_lag1 + eps)`
-2) Try alternate quantity objectives:
-   - Tweedie / Poisson-like approaches (careful with LightGBM objective support)
-3) Better validation strategy:
-   - multiple rolling time splits, not just a single last-N-weeks split
 
 ---
 
