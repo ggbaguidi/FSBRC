@@ -48,12 +48,15 @@ Important rule: **No manual thresholding** (no fixed cut-off like “if p > 0.3 
   - `train.py` — model training + time-split validation + saving artifacts
   - `predict.py` — inference + submission generation
   - `cache_features.py` — optional Parquet caching for faster iteration
+  - `plot_experiments.py` — summarize/plot experiment runs saved from training
+  - `blend_submissions.py` — blend two submission CSVs by `ID` (simple ensemble)
 - `artifacts/` (generated)
   - `lgb_purchase_1w.txt`, `lgb_purchase_2w.txt`
   - `lgb_qty_1w.txt`, `lgb_qty_2w.txt`
   - optional: `lgb_qty_cond_1w.txt`, `lgb_qty_cond_2w.txt`
   - `meta.json`, `report.json`
   - optional cache: `features_train.parquet`
+  - experiment log: `experiments.jsonl`
 
 ---
 
@@ -98,6 +101,21 @@ Aggregated per `(product_unit_variant_id, week_start)` and shifted by 1 week:
 
 #### D) Static / slowly changing
 - `customer_age_weeks` computed from `customer_created_at` and `week_start`
+
+#### E) Affinity / ratio features (added)
+
+We also add a few **leakage-safe affinity features** computed from *already shifted* signals:
+
+- Customer share ratios (previous week):
+  - `aff_lag1_qty_cust_share = lag1_qty / (cust_qty_sum_lag1 + eps)`
+  - `aff_lag1_spend_cust_share = lag1_spend / (cust_spend_sum_lag1 + eps)`
+- SKU share ratios (previous week):
+  - `aff_lag1_qty_sku_share = lag1_qty / (sku_qty_sum_lag1 + eps)`
+  - `aff_lag1_spend_sku_share = lag1_spend / (sku_spend_sum_lag1 + eps)`
+- Rolling purchase rates:
+  - `roll{w}_purch_rate = roll{w}_purch_cnt / w`
+
+All ratios use a small $\varepsilon$ and default to 0 when the denominator is missing.
 
 ### 3.2 Test-time “point-in-time” join
 
@@ -193,6 +211,13 @@ Optional:
 
 - `--two-stage-qty` trains conditional quantity models as well (kept for experimentation).
 - `--qty-objective` lets you experiment with alternative LightGBM objectives for quantity (default: `regression_l1`).
+- `--purchase-params` / `--qty-params` let you override LightGBM hyperparameters without editing code.
+
+Example (inline JSON):
+
+- `python src/train.py --use-cache --cv-folds 3 --val-weeks 6 --purchase-params '{"num_leaves":127,"min_data_in_leaf":100}' --qty-params '{"num_leaves":127,"min_data_in_leaf":80}'`
+
+Tip: pass JSON inside **single quotes** to avoid shell escaping issues.
 
 ### 5.3 Generate a submission
 
@@ -259,6 +284,46 @@ This writes:
 - **Polars panic / rolling on Int8**: We cast `purchased_this_week` to `Int32` for rolling sums.
 - **LightGBM + pandas Arrow dtypes error**: We convert Polars to pandas with NumPy dtypes (`use_pyarrow_extension_array=False`).
 - **Missing columns in Test (e.g., selling_price)**: Feature casting is guarded; absent columns are skipped.
+
+---
+
+## 9) Keeping scores + visualizing experiments
+
+Every time you run `python src/train.py ...`, the script appends a compact record to:
+
+- `artifacts/experiments.jsonl`
+
+This includes timestamps, the CLI args you used, and the main CV metrics (AUC/MAE means).
+
+To export and visualize later:
+
+- `python src/plot_experiments.py`
+
+Outputs:
+
+- `artifacts/experiments.csv` (easy to open in Excel / pandas)
+- optional `artifacts/experiments.png` (requires `matplotlib`)
+
+If you want plots:
+
+- `pip install matplotlib`
+
+---
+
+## 10) Blending two submissions (extra ensemble boost)
+
+If you trained two different configs (or two different feature sets), you can blend their CSVs by `ID`:
+
+- `python src/blend_submissions.py --a sub_A.csv --b sub_B.csv --w 0.5 --out submission_blend.csv`
+
+This computes:
+
+$$\hat{y} = w \cdot \hat{y}_A + (1-w) \cdot \hat{y}_B$$
+
+with safety rules:
+
+- probabilities clipped to $(10^{-6}, 1 - 10^{-6})$
+- quantities clipped to $\ge 0$
 
 ---
 
