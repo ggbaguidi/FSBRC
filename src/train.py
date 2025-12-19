@@ -37,6 +37,49 @@ def _time_split(df: pl.DataFrame, val_weeks: int) -> tuple[pl.DataFrame, pl.Data
     return train_df, val_df
 
 
+def _rolling_week_blocks(weeks: np.ndarray, *, val_weeks: int, cv_folds: int) -> list[np.ndarray]:
+    """Return validation week blocks for rolling time CV.
+
+    Fold 0 is the most recent validation block, then fold 1 is the block before that, etc.
+    Each block has exactly `val_weeks` unique weeks.
+    """
+
+    if cv_folds <= 0:
+        raise ValueError("cv_folds must be >= 1")
+    if val_weeks <= 0:
+        raise ValueError("val_weeks must be >= 1")
+
+    weeks = np.array(weeks)
+    if weeks.ndim != 1:
+        raise ValueError("weeks must be a 1D array")
+    if len(weeks) <= val_weeks + 2:
+        raise ValueError(f"Not enough weeks for time split: {len(weeks)}")
+
+    blocks: list[np.ndarray] = []
+    for fold in range(cv_folds):
+        start = -(fold + 1) * val_weeks
+        end = -fold * val_weeks if fold > 0 else None
+        block = weeks[start:end]
+        if len(block) != val_weeks:
+            raise ValueError(
+                f"Cannot create fold {fold}: expected {val_weeks} weeks but got {len(block)}. "
+                f"Try reducing --cv-folds or --val-weeks."
+            )
+        blocks.append(block)
+
+    # Ensure blocks are strictly ordered back in time
+    for i in range(1, len(blocks)):
+        if not (blocks[i][-1] < blocks[i - 1][0]):
+            raise ValueError("Rolling CV blocks overlap or are not ordered; check week extraction.")
+    return blocks
+
+
+def _get_sorted_unique_weeks(pdf) -> np.ndarray:
+    # Robustly coerce week_start to numpy datetime64[D] and return sorted unique weeks.
+    week_arr = np.array(pdf["week_start"].values, dtype="datetime64[D]")
+    return np.sort(np.unique(week_arr))
+
+
 def _train_lgbm(
     X_train,
     y_train,
@@ -123,7 +166,19 @@ def _scale_pos_weight(y: np.ndarray) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--val-weeks", type=int, default=6)
+    ap.add_argument(
+        "--cv-folds",
+        type=int,
+        default=1,
+        help="Number of rolling time folds to train and (optionally) ensemble. 1 keeps the original single-split behavior.",
+    )
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--qty-objective",
+        type=str,
+        default="regression_l1",
+        help="LightGBM objective for quantity models (default: regression_l1). Examples: regression, huber, tweedie, poisson.",
+    )
     ap.add_argument(
         "--two-stage-qty",
         action="store_true",
@@ -135,6 +190,9 @@ def main() -> None:
         help="If artifacts/features_train.parquet exists, load it instead of rebuilding features from Train.csv.",
     )
     args = ap.parse_args()
+
+    if args.cv_folds > 1 and args.two_stage_qty:
+        raise ValueError("--two-stage-qty is not supported with --cv-folds > 1 (too many extra models).")
 
     ARTIFACTS.mkdir(exist_ok=True)
 
@@ -149,85 +207,105 @@ def main() -> None:
         # Materialize once. Keep only needed cols to reduce RAM.
         feat_df = feat_lf.collect(streaming=True)
 
-    train_df, val_df = _time_split(feat_df, val_weeks=args.val_weeks)
+    # Convert once to pandas; then do all splits as masks on the same arrays.
+    X_all, feature_names, cat_idx, pdf_all = to_pandas_for_lgbm(feat_df, categorical=CATEGORICAL_COLS)
+    weeks_sorted = _get_sorted_unique_weeks(pdf_all)
+    val_blocks = _rolling_week_blocks(weeks_sorted, val_weeks=args.val_weeks, cv_folds=args.cv_folds)
+    week_arr = np.array(pdf_all["week_start"].values, dtype="datetime64[D]")
 
-    # Convert each to pandas
-    X_train, feature_names, cat_idx, _ = to_pandas_for_lgbm(train_df, categorical=CATEGORICAL_COLS)
-    X_val, _, _, _ = to_pandas_for_lgbm(val_df, categorical=CATEGORICAL_COLS)
+    report: dict[str, dict] = {
+        "config": asdict(cfg),
+        "val_weeks": args.val_weeks,
+        "cv_folds": args.cv_folds,
+        "qty_objective": args.qty_objective,
+    }
 
-    report: dict[str, dict] = {"config": asdict(cfg), "val_weeks": args.val_weeks}
+    model_files: dict[str, list[str]] = {"purchase_1w": [], "purchase_2w": [], "qty_1w": [], "qty_2w": []}
 
-    # 1w purchase
-    ytr = train_df["Target_purchase_next_1w"].to_numpy()
-    yva = val_df["Target_purchase_next_1w"].to_numpy()
-    spw_1w = _scale_pos_weight(ytr)
-    m1, r1 = _train_lgbm(
-        X_train,
-        ytr,
-        X_val,
-        yva,
-        feature_names,
-        cat_idx,
+    def _train_over_folds(target_col: str, *, model_key: str, objective: str, metric: str, seed0: int, extra_params_fn=None):
+        fold_metrics: list[float] = []
+        fold_best_iters: list[int] = []
+        fold_paths: list[str] = []
+
+        for fold, block in enumerate(val_blocks):
+            # Validation weeks are exactly `block`; training is strictly before the first val week.
+            val_mask = np.isin(week_arr, block)
+            train_mask = week_arr < block[0]
+
+            X_train = X_all.loc[train_mask]
+            X_val = X_all.loc[val_mask]
+            y_train = np.asarray(pdf_all[target_col].values)[train_mask]
+            y_val = np.asarray(pdf_all[target_col].values)[val_mask]
+
+            extra_params = extra_params_fn(y_train) if extra_params_fn else None
+            booster, fold_report = _train_lgbm(
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+                feature_names,
+                cat_idx,
+                objective=objective,
+                metric=metric,
+                seed=seed0 + fold,
+                extra_params=extra_params,
+            )
+
+            # Persist each fold model (enables optional ensemble at predict time)
+            out_name = f"lgb_{model_key}_fold{fold}.txt" if args.cv_folds > 1 else f"lgb_{model_key}.txt"
+            out_path = ARTIFACTS / out_name
+            booster.save_model(str(out_path))
+            fold_paths.append(out_name)
+
+            if "val_auc" in fold_report:
+                fold_metrics.append(float(fold_report["val_auc"]))
+            elif "val_mae" in fold_report:
+                fold_metrics.append(float(fold_report["val_mae"]))
+            fold_best_iters.append(int(fold_report.get("best_iteration", 0) or 0))
+
+        # Aggregate
+        agg = {
+            "fold_metrics": fold_metrics,
+            "fold_best_iterations": fold_best_iters,
+            "mean": float(np.mean(fold_metrics)) if fold_metrics else None,
+            "std": float(np.std(fold_metrics)) if fold_metrics else None,
+        }
+        report[model_key] = agg
+        model_files[model_key] = fold_paths
+
+    # Purchase models (classification)
+    _train_over_folds(
+        "Target_purchase_next_1w",
+        model_key="purchase_1w",
         objective="binary",
         metric="auc",
-        seed=args.seed,
-        extra_params={"scale_pos_weight": spw_1w},
+        seed0=args.seed,
+        extra_params_fn=lambda y: {"scale_pos_weight": _scale_pos_weight(y)},
     )
-    m1.save_model(str(ARTIFACTS / "lgb_purchase_1w.txt"))
-    report["purchase_1w"] = {**r1, "scale_pos_weight": spw_1w}
-
-    # 2w purchase
-    ytr = train_df["Target_purchase_next_2w"].to_numpy()
-    yva = val_df["Target_purchase_next_2w"].to_numpy()
-    spw_2w = _scale_pos_weight(ytr)
-    m2, r2 = _train_lgbm(
-        X_train,
-        ytr,
-        X_val,
-        yva,
-        feature_names,
-        cat_idx,
+    _train_over_folds(
+        "Target_purchase_next_2w",
+        model_key="purchase_2w",
         objective="binary",
         metric="auc",
-        seed=args.seed + 1,
-        extra_params={"scale_pos_weight": spw_2w},
+        seed0=args.seed + 10,
+        extra_params_fn=lambda y: {"scale_pos_weight": _scale_pos_weight(y)},
     )
-    m2.save_model(str(ARTIFACTS / "lgb_purchase_2w.txt"))
-    report["purchase_2w"] = {**r2, "scale_pos_weight": spw_2w}
 
-    # 1w qty (MAE-friendly objective)
-    ytr = train_df["Target_qty_next_1w"].to_numpy()
-    yva = val_df["Target_qty_next_1w"].to_numpy()
-    m3, r3 = _train_lgbm(
-        X_train,
-        ytr,
-        X_val,
-        yva,
-        feature_names,
-        cat_idx,
-        objective="regression_l1",
+    # Quantity models
+    _train_over_folds(
+        "Target_qty_next_1w",
+        model_key="qty_1w",
+        objective=args.qty_objective,
         metric="l1",
-        seed=args.seed + 2,
+        seed0=args.seed + 20,
     )
-    m3.save_model(str(ARTIFACTS / "lgb_qty_1w.txt"))
-    report["qty_1w"] = r3
-
-    # 2w qty
-    ytr = train_df["Target_qty_next_2w"].to_numpy()
-    yva = val_df["Target_qty_next_2w"].to_numpy()
-    m4, r4 = _train_lgbm(
-        X_train,
-        ytr,
-        X_val,
-        yva,
-        feature_names,
-        cat_idx,
-        objective="regression_l1",
+    _train_over_folds(
+        "Target_qty_next_2w",
+        model_key="qty_2w",
+        objective=args.qty_objective,
         metric="l1",
-        seed=args.seed + 3,
+        seed0=args.seed + 30,
     )
-    m4.save_model(str(ARTIFACTS / "lgb_qty_2w.txt"))
-    report["qty_2w"] = r4
 
     # Optional: two-stage quantity modeling
     #   q_hat = p_hat * q_hat_cond
@@ -237,6 +315,15 @@ def main() -> None:
     use_two_stage_2w = False
     if two_stage_enabled:
         report["qty_two_stage"] = {}
+
+        # For two-stage mode we keep the original single split behavior.
+        train_df, val_df = _time_split(feat_df, val_weeks=args.val_weeks)
+        X_train, _, _, _ = to_pandas_for_lgbm(train_df, categorical=CATEGORICAL_COLS)
+        X_val, _, _, _ = to_pandas_for_lgbm(val_df, categorical=CATEGORICAL_COLS)
+
+        # Load (single) purchase models from the most recent fold (fold0 when cv_folds>1 is disabled here)
+        m1 = lgb.Booster(model_file=str(ARTIFACTS / "lgb_purchase_1w.txt"))
+        m2 = lgb.Booster(model_file=str(ARTIFACTS / "lgb_purchase_2w.txt"))
 
         # Precompute purchase predictions on validation for combination
         p1_val = m1.predict(X_val)
@@ -318,6 +405,7 @@ def main() -> None:
         "feature_names": feature_names,
         "categorical_cols": CATEGORICAL_COLS,
         "config": asdict(cfg),
+        "model_files": model_files,
         "qty_two_stage_trained": bool(args.two_stage_qty),
         # Automatically pick the better approach per horizon.
         "qty_use_two_stage_1w": use_two_stage_1w,
