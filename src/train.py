@@ -4,6 +4,8 @@ import argparse
 import json
 import pathlib
 from dataclasses import asdict
+from typing import Any
+import ast
 
 import lightgbm as lgb
 import numpy as np
@@ -154,6 +156,51 @@ def _train_lgbm(
     return booster, {"note": "trained_without_validation", "best_iteration": booster.current_iteration()}
 
 
+def _load_params_override(raw: str | None) -> dict[str, Any]:
+    """Load a JSON dict from either a file path or an inline JSON string.
+
+    Examples:
+      --qty-params '{"objective":"huber","alpha":0.8}'
+      --purchase-params artifacts/purchase_params.json
+    """
+
+    if not raw:
+        return {}
+
+    p = pathlib.Path(raw)
+    def _parse_json(s: str) -> dict[str, Any]:
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            raise ValueError("Params override must be a JSON object (dict)")
+        return obj
+
+    if p.exists() and p.is_file():
+        data = _parse_json(p.read_text())
+        return data
+
+    # Try strict JSON first.
+    try:
+        return _parse_json(raw)
+    except json.JSONDecodeError:
+        # Common shell mistake: users pass {\"k\": 1} instead of {"k": 1}.
+        # Retry by un-escaping quotes.
+        try:
+            fixed = raw.replace('\\"', '"')
+            return _parse_json(fixed)
+        except json.JSONDecodeError:
+            # As a last resort, accept Python dict syntax.
+            try:
+                obj = ast.literal_eval(raw)
+            except Exception as e:
+                raise ValueError(
+                    "Could not parse params override. Use valid JSON, e.g. "
+                    "--purchase-params '{\"num_leaves\":127,\"min_data_in_leaf\":100}'."
+                ) from e
+            if not isinstance(obj, dict):
+                raise ValueError("Params override must be a dict")
+            return obj
+
+
 def _scale_pos_weight(y: np.ndarray) -> float:
     # pos_weight = n_negative / n_positive
     pos = float(np.sum(y == 1))
@@ -180,6 +227,18 @@ def main() -> None:
         help="LightGBM objective for quantity models (default: regression_l1). Examples: regression, huber, tweedie, poisson.",
     )
     ap.add_argument(
+        "--purchase-params",
+        type=str,
+        default=None,
+        help="JSON dict (inline or file path) to override LightGBM params for purchase models.",
+    )
+    ap.add_argument(
+        "--qty-params",
+        type=str,
+        default=None,
+        help="JSON dict (inline or file path) to override LightGBM params for quantity models.",
+    )
+    ap.add_argument(
         "--two-stage-qty",
         action="store_true",
         help="Train extra quantity models conditional on purchase and combine with purchase probability.",
@@ -197,6 +256,9 @@ def main() -> None:
     ARTIFACTS.mkdir(exist_ok=True)
 
     cfg = FeatureConfig()
+
+    purchase_params_override = _load_params_override(args.purchase_params)
+    qty_params_override = _load_params_override(args.qty_params)
 
     cache_path = ARTIFACTS / "features_train.parquet"
     if args.use_cache and cache_path.exists():
@@ -218,6 +280,8 @@ def main() -> None:
         "val_weeks": args.val_weeks,
         "cv_folds": args.cv_folds,
         "qty_objective": args.qty_objective,
+        "purchase_params_override": purchase_params_override,
+        "qty_params_override": qty_params_override,
     }
 
     model_files: dict[str, list[str]] = {"purchase_1w": [], "purchase_2w": [], "qty_1w": [], "qty_2w": []}
@@ -280,7 +344,7 @@ def main() -> None:
         objective="binary",
         metric="auc",
         seed0=args.seed,
-        extra_params_fn=lambda y: {"scale_pos_weight": _scale_pos_weight(y)},
+        extra_params_fn=lambda y: {**purchase_params_override, "scale_pos_weight": _scale_pos_weight(y)},
     )
     _train_over_folds(
         "Target_purchase_next_2w",
@@ -288,7 +352,7 @@ def main() -> None:
         objective="binary",
         metric="auc",
         seed0=args.seed + 10,
-        extra_params_fn=lambda y: {"scale_pos_weight": _scale_pos_weight(y)},
+        extra_params_fn=lambda y: {**purchase_params_override, "scale_pos_weight": _scale_pos_weight(y)},
     )
 
     # Quantity models
@@ -298,6 +362,7 @@ def main() -> None:
         objective=args.qty_objective,
         metric="l1",
         seed0=args.seed + 20,
+        extra_params_fn=(lambda _y: qty_params_override) if qty_params_override else None,
     )
     _train_over_folds(
         "Target_qty_next_2w",
@@ -305,6 +370,7 @@ def main() -> None:
         objective=args.qty_objective,
         metric="l1",
         seed0=args.seed + 30,
+        extra_params_fn=(lambda _y: qty_params_override) if qty_params_override else None,
     )
 
     # Optional: two-stage quantity modeling
