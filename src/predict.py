@@ -20,6 +20,20 @@ def _clip_proba(p: np.ndarray) -> np.ndarray:
     return np.clip(p, 1e-6, 1 - 1e-6)
 
 
+def _load_model_ensemble(meta: dict, *, key: str, default_filename: str) -> list[lgb.Booster]:
+    model_files = (meta.get("model_files") or {}).get(key)
+    if isinstance(model_files, list) and len(model_files) > 0:
+        return [lgb.Booster(model_file=str(ARTIFACTS / fn)) for fn in model_files]
+    return [lgb.Booster(model_file=str(ARTIFACTS / default_filename))]
+
+
+def _predict_mean(models: list[lgb.Booster], X) -> np.ndarray:
+    if len(models) == 1:
+        return models[0].predict(X)
+    preds = [m.predict(X) for m in models]
+    return np.mean(np.vstack(preds), axis=0)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=str, default=str(ROOT / "submission.csv"))
@@ -33,12 +47,11 @@ def main() -> None:
     qty_use_two_stage_2w = bool(meta.get("qty_use_two_stage_2w", False))
     qty_cond_log1p = bool(meta.get("qty_cond_log1p", True))
 
-    # Load models
-    m_p1 = lgb.Booster(model_file=str(ARTIFACTS / "lgb_purchase_1w.txt"))
-    m_p2 = lgb.Booster(model_file=str(ARTIFACTS / "lgb_purchase_2w.txt"))
-    # Direct-qty models (fallback)
-    m_q1 = lgb.Booster(model_file=str(ARTIFACTS / "lgb_qty_1w.txt"))
-    m_q2 = lgb.Booster(model_file=str(ARTIFACTS / "lgb_qty_2w.txt"))
+    # Load models (single model or ensemble across folds)
+    m_p1_list = _load_model_ensemble(meta, key="purchase_1w", default_filename="lgb_purchase_1w.txt")
+    m_p2_list = _load_model_ensemble(meta, key="purchase_2w", default_filename="lgb_purchase_2w.txt")
+    m_q1_list = _load_model_ensemble(meta, key="qty_1w", default_filename="lgb_qty_1w.txt")
+    m_q2_list = _load_model_ensemble(meta, key="qty_2w", default_filename="lgb_qty_2w.txt")
 
     # Optional conditional-qty models (two-stage)
     cond_1w_path = ARTIFACTS / "lgb_qty_cond_1w.txt"
@@ -80,8 +93,8 @@ def main() -> None:
                 X[c] = X[c].astype("category")
 
     # Predict
-    p1 = _clip_proba(m_p1.predict(X))
-    p2 = _clip_proba(m_p2.predict(X))
+    p1 = _clip_proba(_predict_mean(m_p1_list, X))
+    p2 = _clip_proba(_predict_mean(m_p2_list, X))
 
     # Quantity
     can_two_stage = (m_q1c is not None) and (m_q2c is not None)
@@ -94,14 +107,14 @@ def main() -> None:
         q1_two = np.clip(p1 * q1c, 0.0, None)
         q2_two = np.clip(p2 * q2c, 0.0, None)
 
-        q1_dir = np.clip(m_q1.predict(X), 0.0, None)
-        q2_dir = np.clip(m_q2.predict(X), 0.0, None)
+        q1_dir = np.clip(_predict_mean(m_q1_list, X), 0.0, None)
+        q2_dir = np.clip(_predict_mean(m_q2_list, X), 0.0, None)
 
         q1 = q1_two if qty_use_two_stage_1w else q1_dir
         q2 = q2_two if qty_use_two_stage_2w else q2_dir
     else:
-        q1 = np.clip(m_q1.predict(X), 0.0, None)
-        q2 = np.clip(m_q2.predict(X), 0.0, None)
+        q1 = np.clip(_predict_mean(m_q1_list, X), 0.0, None)
+        q2 = np.clip(_predict_mean(m_q2_list, X), 0.0, None)
 
     sub = pl.DataFrame(
         {
