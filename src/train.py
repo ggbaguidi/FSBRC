@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import pathlib
 from dataclasses import asdict
 from typing import Any
 import ast
+import uuid
 
 import lightgbm as lgb
 import numpy as np
@@ -253,6 +255,9 @@ def main() -> None:
     if args.cv_folds > 1 and args.two_stage_qty:
         raise ValueError("--two-stage-qty is not supported with --cv-folds > 1 (too many extra models).")
 
+    run_id = uuid.uuid4().hex[:12]
+    started_at_utc = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
     ARTIFACTS.mkdir(exist_ok=True)
 
     cfg = FeatureConfig()
@@ -276,6 +281,8 @@ def main() -> None:
     week_arr = np.array(pdf_all["week_start"].values, dtype="datetime64[D]")
 
     report: dict[str, dict] = {
+        "run_id": run_id,
+        "started_at_utc": started_at_utc,
         "config": asdict(cfg),
         "val_weeks": args.val_weeks,
         "cv_folds": args.cv_folds,
@@ -480,6 +487,25 @@ def main() -> None:
     }
     (ARTIFACTS / "meta.json").write_text(json.dumps(meta, indent=2))
     (ARTIFACTS / "report.json").write_text(json.dumps(report, indent=2))
+
+    # Append a compact experiment record for later visualization/analysis.
+    # JSONL makes it easy to accumulate runs without rewriting a big file.
+    exp_path = ARTIFACTS / "experiments.jsonl"
+    exp_record = {
+        "run_id": run_id,
+        "started_at_utc": started_at_utc,
+        "args": vars(args),
+        "purchase_1w_mean_auc": report.get("purchase_1w", {}).get("mean"),
+        "purchase_2w_mean_auc": report.get("purchase_2w", {}).get("mean"),
+        "qty_1w_mean_mae": report.get("qty_1w", {}).get("mean"),
+        "qty_2w_mean_mae": report.get("qty_2w", {}).get("mean"),
+        "model_files": model_files,
+        "feature_count": int(len(feature_names)),
+    }
+    with exp_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(exp_record, ensure_ascii=False) + "\n")
+
+    print(f"\n[experiment] Logged run to {exp_path} (run_id={run_id})")
 
     print("\n## Validation report")
     print(json.dumps(report, indent=2))
