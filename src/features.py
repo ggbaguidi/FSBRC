@@ -200,6 +200,64 @@ def _add_cust_sku_history_features(lf: pl.LazyFrame, cfg: FeatureConfig) -> pl.L
     return lf
 
 
+def _safe_ratio(num: pl.Expr, den: pl.Expr, *, eps: float = 1e-3, name: str) -> pl.Expr:
+    """Safe ratio feature: returns 0 when denominator is null/<=0.
+
+    We intentionally keep this simple and deterministic for LightGBM.
+    """
+
+    den_f = den.cast(pl.Float32).fill_null(0.0)
+    num_f = num.cast(pl.Float32).fill_null(0.0)
+    return (
+        pl.when(den_f > 0)
+        .then(num_f / (den_f + pl.lit(eps, dtype=pl.Float32)))
+        .otherwise(pl.lit(0.0, dtype=pl.Float32))
+        .alias(name)
+    )
+
+
+def _add_affinity_ratio_features(lf: pl.LazyFrame, cfg: FeatureConfig) -> pl.LazyFrame:
+    """Add customer-SKU affinity ratios and simple rates.
+
+    These are computed only from already leakage-safe inputs (lagged / shifted aggregates).
+    """
+
+    cols = set(lf.collect_schema().names())
+    out_exprs: list[pl.Expr] = []
+
+    # Shares vs customer previous-week totals
+    if {"lag1_qty", "cust_qty_sum_lag1"}.issubset(cols):
+        out_exprs.append(_safe_ratio(pl.col("lag1_qty"), pl.col("cust_qty_sum_lag1"), name="aff_lag1_qty_cust_share"))
+    if {"lag1_spend", "cust_spend_sum_lag1"}.issubset(cols):
+        out_exprs.append(
+            _safe_ratio(pl.col("lag1_spend"), pl.col("cust_spend_sum_lag1"), name="aff_lag1_spend_cust_share")
+        )
+
+    # Shares vs SKU previous-week totals
+    if {"lag1_qty", "sku_qty_sum_lag1"}.issubset(cols):
+        out_exprs.append(_safe_ratio(pl.col("lag1_qty"), pl.col("sku_qty_sum_lag1"), name="aff_lag1_qty_sku_share"))
+    if {"lag1_spend", "sku_spend_sum_lag1"}.issubset(cols):
+        out_exprs.append(_safe_ratio(pl.col("lag1_spend"), pl.col("sku_spend_sum_lag1"), name="aff_lag1_spend_sku_share"))
+
+    # Rolling purchase rate per window (counts are already shifted)
+    for w in cfg.windows:
+        c_cnt = f"roll{w}_purch_cnt"
+        if c_cnt in cols:
+            out_exprs.append((pl.col(c_cnt).cast(pl.Float32) / pl.lit(float(w), dtype=pl.Float32)).alias(f"roll{w}_purch_rate"))
+
+    # Rolling quantity shares vs customer / sku totals (using previous-week totals as stabilizers)
+    for w in cfg.windows:
+        c_qty = f"roll{w}_qty_sum"
+        if c_qty in cols and "cust_qty_sum_lag1" in cols:
+            out_exprs.append(_safe_ratio(pl.col(c_qty), pl.col("cust_qty_sum_lag1"), name=f"aff_roll{w}_qty_cust_share"))
+        if c_qty in cols and "sku_qty_sum_lag1" in cols:
+            out_exprs.append(_safe_ratio(pl.col(c_qty), pl.col("sku_qty_sum_lag1"), name=f"aff_roll{w}_qty_sku_share"))
+
+    if out_exprs:
+        lf = lf.with_columns(out_exprs)
+    return lf
+
+
 def _cast_and_basic(lf: pl.LazyFrame, keep_targets: bool) -> pl.LazyFrame:
     cols: list[str] = ["ID", "week_start"] + STATIC_COLS + BEHAV_COLS
     if keep_targets:
@@ -247,6 +305,7 @@ def build_train_features(train_lf: pl.LazyFrame, cfg: FeatureConfig) -> pl.LazyF
     lf = _add_cust_sku_history_features(lf, cfg)
     lf = _add_customer_week_aggregates(lf, cfg)
     lf = _add_sku_week_aggregates(lf, cfg)
+    lf = _add_affinity_ratio_features(lf, cfg)
 
     # Cleanup: remove columns that won't exist in Test (same-week behavior)
     # Keep lag/rolling features.
@@ -353,6 +412,9 @@ def build_test_features(
             num_cols.append(name)
 
     joined = joined.with_columns([pl.col(c).fill_null(0) for c in num_cols])
+
+    # Add ratio/rate features (must happen after joins so required columns are present)
+    joined = _add_affinity_ratio_features(joined, cfg)
     return joined
 
 
