@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 *.zip
 *.pdf
+*.parquet
+*.pkl
+*.txt
