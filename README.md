@@ -195,7 +195,7 @@ Run:
 
 This writes `submission.csv` in the repo root by default.
 
-### 5.4 End-to-end (train  predict  submission)
+### 5.4 End-to-end (train -> predict -> submission)
 
 Minimal (rebuild features from `data/Train.csv` each time):
 
