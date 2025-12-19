@@ -1,0 +1,8 @@
+.venv
+*.csv
+artifacts/
+logs/
+__pycache__/
+*.pyc
+*.zip
+*.pdf
